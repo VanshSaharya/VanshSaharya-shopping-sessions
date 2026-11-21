@@ -3,3 +3,8 @@ out/
 dev-answer/
 target/
 *.parquet
+
+
+# Added by cargo
+
+/target
