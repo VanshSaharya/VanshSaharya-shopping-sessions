@@ -73,115 +73,110 @@ fn pbucket(k: K) -> usize {
 
 // ---------------------------------------------------------------- SIMD line scanner
 
+/// Masks of commas, newlines and quotes in a 64-byte block.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn masks64(b: &[u8]) -> u64 {
+fn masks64(b: &[u8]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     unsafe {
         let p = b.as_ptr();
         let a = _mm256_loadu_si256(p as *const __m256i);
         let c = _mm256_loadu_si256(p.add(32) as *const __m256i);
-        let comma = _mm256_set1_epi8(b',' as i8);
-        let nl = _mm256_set1_epi8(b'\n' as i8);
-        let q = _mm256_set1_epi8(b'"' as i8);
-        let ma = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, nl)),
-            _mm256_cmpeq_epi8(a, q),
-        );
-        let mc = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(c, comma), _mm256_cmpeq_epi8(c, nl)),
-            _mm256_cmpeq_epi8(c, q),
-        );
-        (_mm256_movemask_epi8(ma) as u32 as u64) | ((_mm256_movemask_epi8(mc) as u32 as u64) << 32)
+        let m = |v: __m256i, x: u8| -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 };
+        let j = |x: u8| -> u64 { (m(a, x) as u64) | ((m(c, x) as u64) << 32) };
+        (j(b','), j(b'\n'), j(b'"'))
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-fn masks64(b: &[u8]) -> u64 {
-    let mut m = 0u64;
-    for (i, &c) in b[..64].iter().enumerate() {
-        m |= ((c == b',' || c == b'\n' || c == b'"') as u64) << i;
+fn masks64(b: &[u8]) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for (i, &x) in b[..64].iter().enumerate() {
+        c |= ((x == b',') as u64) << i;
+        n |= ((x == b'\n') as u64) << i;
+        q |= ((x == b'"') as u64) << i;
     }
-    m
-}
-
-#[inline(always)]
-fn unquote(v: &[u8]) -> Option<&[u8]> {
-    if v.first() == Some(&b'"') {
-        if v.len() < 2 || v[v.len() - 1] != b'"' || memchr::memchr(b'"', &v[1..v.len() - 1]).is_some() {
-            return None;
-        }
-        Some(&v[1..v.len() - 1])
-    } else if memchr::memchr(b'"', v).is_some() {
-        None
-    } else {
-        Some(v)
-    }
+    (c, n, q)
 }
 
 /// Call `f` with the N fields of every well-formed line of `buf` (no header in `buf`).
+/// Quote syntax is checked from the recorded quote positions: a field holds either no
+/// quote, or exactly one at its first byte and one at its last (and is then unwrapped).
 #[inline(always)]
 fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let n = buf.len();
     let mut cuts = [0usize; N];
     let mut nc = 0usize;
-    let mut quote = false;
+    let mut qs = [0usize; 64];
+    let mut nq = 0usize;
     let mut line_start = 0usize;
-    let mut emit = |start: usize, end: usize, cuts: &[usize; N], nc: usize, quote: bool| {
-        if nc != N - 1 {
+    let mut emit = |start: usize, end: usize, cuts: &[usize; N], nc: usize, qs: &[usize; 64], nq: usize| {
+        if nc != N - 1 || nq > 2 * N {
             return;
         }
         let mut fs: [&'a [u8]; N] = [&[]; N];
         let mut s = start;
-        for i in 0..N - 1 {
-            fs[i] = &buf[s..cuts[i]];
-            s = cuts[i] + 1;
-        }
-        fs[N - 1] = &buf[s..end];
-        if quote {
-            for x in fs.iter_mut() {
-                match unquote(x) {
-                    Some(v) => *x = v,
-                    None => return,
+        let mut qi = 0usize;
+        for i in 0..N {
+            let e = if i + 1 < N { cuts[i] } else { end };
+            if qi < nq && qs[qi] < e {
+                // quotes in this field must be exactly at s and e - 1
+                if qs[qi] != s || qi + 1 >= nq || qs[qi + 1] != e - 1 || e - 1 == s {
+                    return;
                 }
+                if qi + 2 < nq && qs[qi + 2] < e {
+                    return;
+                }
+                fs[i] = &buf[s + 1..e - 1];
+                qi += 2;
+            } else {
+                fs[i] = &buf[s..e];
             }
+            s = e + 1;
         }
         f(&fs);
     };
     let mut base = 0usize;
     let mut tail = [0u8; 64];
     while base < n {
-        let mut mask = if base + 64 <= n {
+        let (mut cm, mut nm, mut qm) = if base + 64 <= n {
             masks64(&buf[base..base + 64])
         } else {
             tail[..n - base].copy_from_slice(&buf[base..n]);
             tail[n - base..].fill(0);
             masks64(&tail)
         };
-        while mask != 0 {
-            let pos = base + mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            match buf[pos] {
-                b',' => {
-                    if nc < N {
-                        cuts[nc] = pos;
-                    }
-                    nc += 1;
-                }
-                b'"' => quote = true,
-                _ => {
-                    emit(line_start, pos, &cuts, nc, quote);
-                    line_start = pos + 1;
-                    nc = 0;
-                    quote = false;
-                }
+        loop {
+            let upto = if nm != 0 { (1u64 << nm.trailing_zeros()) - 1 } else { !0u64 };
+            let mut c = cm & upto;
+            cm &= !upto;
+            while c != 0 {
+                cuts[nc.min(N - 1)] = base + c.trailing_zeros() as usize;
+                nc += 1;
+                c &= c - 1;
             }
+            let mut q = qm & upto;
+            qm &= !upto;
+            while q != 0 {
+                qs[nq.min(63)] = base + q.trailing_zeros() as usize;
+                nq += 1;
+                q &= q - 1;
+            }
+            if nm == 0 {
+                break;
+            }
+            let pos = base + nm.trailing_zeros() as usize;
+            nm &= nm - 1;
+            emit(line_start, pos, &cuts, nc, &qs, nq);
+            line_start = pos + 1;
+            nc = 0;
+            nq = 0;
         }
         base += 64;
     }
     if line_start < n {
-        emit(line_start, n, &cuts, nc, quote);
+        emit(line_start, n, &cuts, nc, &qs, nq);
     }
 }
 
@@ -240,6 +235,248 @@ fn chunk_bytes<'a>(maps: &'a [Option<memmap2::Mmap>], c: &crate::slow::Chunk) ->
         let _ = m.advise_range(memmap2::Advice::PopulateRead, page, c.end - page);
     }
     &m[c.start..c.end]
+}
+
+/// Everything needed to turn one event line into a record.
+pub struct ECtx<'a> {
+    pub ws: i64,
+    pub we: i64,
+    pub base: i64,
+    pub prod: &'a Lookup<u16>,
+    pub unknown_cat: u16,
+    pub long: &'a AtomicBool,
+}
+
+impl ECtx<'_> {
+    /// None: skip the line (empty or long event_id). Some with kind 0: an invalid kept copy.
+    #[inline(always)]
+    fn parse(&self, f: &[&[u8]; 7]) -> Option<E> {
+        if f[0].is_empty() {
+            return None;
+        }
+        let Some(ek) = pack(f[0]) else {
+            self.long.store(true, Ordering::Relaxed);
+            return None;
+        };
+        let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+        let mut r = E { ek, uk: K::default(), ingest, ts: 0, price: 0, cat: 0, kind: 0 };
+        if f[1].is_empty() || f[5].is_empty() {
+            return Some(r);
+        }
+        let Some(ts) = parse_ts(f[2]) else { return Some(r) };
+        if ts < self.ws || ts >= self.we || ingest == i64::MAX || ingest - ts > DAY_MS {
+            return Some(r);
+        }
+        let kind = match f[4] {
+            b"view" => 1,
+            b"cart" => 2,
+            b"purchase" => 3,
+            _ => return Some(r),
+        };
+        if kind == 3 {
+            let Some(p) = parse_price(f[6]) else { return Some(r) };
+            r.price = p;
+        }
+        let Some(uk) = pack(f[1]) else {
+            self.long.store(true, Ordering::Relaxed);
+            return Some(r);
+        };
+        r.uk = uk;
+        r.cat = self.prod.get(f[5]).unwrap_or(self.unknown_cat);
+        r.ts = (ts - self.base) as u32;
+        r.kind = kind;
+        Some(r)
+    }
+}
+
+/// Single-threaded micro-benchmark of event parsing on one file held in memory.
+pub fn bench(data: PathBuf, file: PathBuf) {
+    let manifest = String::from_utf8_lossy(&read_small(&data.join("manifest.json"))).into_owned();
+    let ws = manifest_ts(&manifest, "\"window_start\"");
+    let we = manifest_ts(&manifest, "\"window_end\"");
+    let products = read_pairs(&data.join("products.csv"));
+    let mut prod: Lookup<u16> = Lookup::new();
+    for (i, (p, _)) in products.iter().enumerate() {
+        prod.insert(p, (i % 20) as u16);
+    }
+    let long = AtomicBool::new(false);
+    let ctx = ECtx { ws, we, base: ws - WEEK_MS, prod: &prod, unknown_cat: 20, long: &long };
+    let raw = std::fs::read(&file).unwrap();
+    let buf = &raw[memchr::memchr(b'\n', &raw).unwrap() + 1..];
+    let lines = memchr::memchr_iter(b'\n', buf).count() as f64;
+    let time = |name: &str, f: &mut dyn FnMut()| {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{name:>14}: {:6.1} ns/line", best * 1e9 / lines);
+    };
+    time("lines", &mut || {
+        let mut n = 0usize;
+        crate::slow::for_lines(buf, |l| n += l.len());
+        std::hint::black_box(n);
+    });
+    time("scan", &mut || {
+        let mut n = 0usize;
+        for_records::<7>(buf, |f| n += f[6].len());
+        std::hint::black_box(n);
+    });
+    time("no-prod", &mut || {
+        let mut n = 0u64;
+        for_records::<7>(buf, |f| {
+            if f[0].is_empty() { return; }
+            let ek = pack(f[0]).unwrap();
+            let ingest = parse_ts(f[3]).unwrap_or(0);
+            let ts = parse_ts(f[2]).unwrap_or(0);
+            let uk = pack(f[1]).unwrap_or_default();
+            let kind = match f[4] { b"view" => 1, b"cart" => 2, b"purchase" => 3, _ => 0 };
+            let p = if kind == 3 { parse_price(f[6]).unwrap_or(0) } else { 0 };
+            n = n.wrapping_add(ek.1 ^ uk.0 ^ ingest as u64 ^ ts as u64 ^ p as u64 ^ kind);
+        });
+        std::hint::black_box(n);
+    });
+    time("prod-only", &mut || {
+        let mut n = 0u64;
+        for_records::<7>(buf, |f| n = n.wrapping_add(ctx.prod.get(f[5]).unwrap_or(0) as u64));
+        std::hint::black_box(n);
+    });
+    time("parse", &mut || {
+        let mut n = 0u64;
+        for_records::<7>(buf, |f| {
+            if let Some(r) = ctx.parse(f) {
+                n = n.wrapping_add(r.ek.1 ^ r.uk.0 ^ r.ingest as u64 ^ r.ts as u64 ^ r.cat as u64 ^ r.price as u64 ^ r.kind as u64);
+            }
+        });
+        std::hint::black_box(n);
+    });
+    {
+        let mut one: Vec<E> = Vec::with_capacity(buf.len() / 70 + 16);
+        time("push-1vec", &mut || {
+            one.clear();
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    one.push(r);
+                }
+            });
+            std::hint::black_box(&one);
+        });
+        let mut small: Vec<Vec<u64>> = (0..256).map(|_| Vec::with_capacity(buf.len() / 70 / 256 + 64)).collect();
+        time("push-u64x256", &mut || {
+            for v in small.iter_mut() { v.clear(); }
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    small[(hk(r.ek) >> 56) as usize].push(r.ek.1 ^ r.uk.0 ^ r.ingest as u64 ^ r.ts as u64 ^ r.cat as u64 ^ r.price as u64 ^ r.kind as u64);
+                }
+            });
+            std::hint::black_box(&small);
+        });
+        time("hk-only", &mut || {
+            let mut n = 0u64;
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    n = n.wrapping_add(hk(r.ek) ^ r.uk.0 ^ r.ingest as u64 ^ r.ts as u64 ^ r.cat as u64 ^ r.price as u64 ^ r.kind as u64);
+                }
+            });
+            std::hint::black_box(n);
+        });
+    }
+    for _ in 0..1 {
+        time("staged8 x256", &mut || {
+            let mut sc: Scatter<E, 8> = Scatter::new(256, buf.len() / 70 / 256 + 64);
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    sc.push((hk(r.ek) >> 56) as usize, r);
+                }
+            });
+            std::hint::black_box(sc.finish());
+        });
+        time("staged16 x256", &mut || {
+            let mut sc: Scatter<E, 16> = Scatter::new(256, buf.len() / 70 / 256 + 64);
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    sc.push((hk(r.ek) >> 56) as usize, r);
+                }
+            });
+            std::hint::black_box(sc.finish());
+        });
+        time("staged32 x64", &mut || {
+            let mut sc: Scatter<E, 32> = Scatter::new(64, buf.len() / 70 / 64 + 64);
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    sc.push((hk(r.ek) >> 58) as usize, r);
+                }
+            });
+            std::hint::black_box(sc.finish());
+        });
+    }
+    for bits in [6u32, 8] {
+        let nb = 1usize << bits;
+        let mut out: Vec<Vec<E>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 4)).collect();
+        time(&format!("warm push{nb}"), &mut || {
+            for v in out.iter_mut() {
+                v.clear();
+            }
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    out[(hk(r.ek) >> (64 - bits)) as usize].push(r);
+                }
+            });
+            std::hint::black_box(&out);
+        });
+    }
+    for bits in [6u32, 8] {
+        let nb = 1usize << bits;
+        time(&format!("parse+push{nb}"), &mut || {
+            let mut out: Vec<Vec<E>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 4)).collect();
+            for_records::<7>(buf, |f| {
+                if let Some(r) = ctx.parse(f) {
+                    out[(hk(r.ek) >> (64 - bits)) as usize].push(r);
+                }
+            });
+            std::hint::black_box(&out);
+        });
+    }
+}
+
+/// Scatter into buckets through small per-bucket staging buffers, flushed in blocks,
+/// so the destination vectors are written sequentially (prefetcher-friendly) rather than
+/// one record at a time across hundreds of streams.
+struct Scatter<T: Copy, const B: usize> {
+    stage: Vec<[std::mem::MaybeUninit<T>; B]>,
+    fill: Vec<u8>,
+    pub out: Vec<Vec<T>>,
+}
+
+impl<T: Copy, const B: usize> Scatter<T, B> {
+    fn new(nb: usize, cap: usize) -> Self {
+        Scatter {
+            stage: (0..nb).map(|_| [std::mem::MaybeUninit::uninit(); B]).collect(),
+            fill: vec![0; nb],
+            out: (0..nb).map(|_| Vec::with_capacity(cap)).collect(),
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, r: T) {
+        let f = self.fill[b] as usize;
+        self.stage[b][f].write(r);
+        if f + 1 == B {
+            let s = unsafe { std::slice::from_raw_parts(self.stage[b].as_ptr() as *const T, B) };
+            self.out[b].extend_from_slice(s);
+            self.fill[b] = 0;
+        } else {
+            self.fill[b] = (f + 1) as u8;
+        }
+    }
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for b in 0..self.out.len() {
+            let f = self.fill[b] as usize;
+            let s = unsafe { std::slice::from_raw_parts(self.stage[b].as_ptr() as *const T, f) };
+            self.out[b].extend_from_slice(s);
+        }
+        self.out
+    }
 }
 
 fn concat<T: Copy>(parts: Vec<Vec<T>>) -> Vec<T> {
@@ -412,6 +649,7 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
     let nd = 1usize << dbits;
     log(&format!("lookups; {} event chunks, {} dedup buckets", ev_chunks.len(), nd));
 
+    let ectx = ECtx { ws, we, base, prod: &prod, unknown_cat, long: &long };
     let (links, (ev_parts, ck_parts)) = rayon::join(
         || build_links(&data, &long),
         || {
@@ -422,55 +660,13 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                         .map(|c| {
                             let buf = chunk_bytes(&ev_maps, c);
                             let cap = (c.end - c.start) / 70 / nd + 4;
-                            let mut out: Vec<Vec<E>> = (0..nd).map(|_| Vec::with_capacity(cap)).collect();
+                            let mut out: Scatter<E, 16> = Scatter::new(nd, cap);
                             for_records::<7>(buf, |f| {
-                                if f[0].is_empty() {
-                                    return;
-                                }
-                                let Some(ek) = pack(f[0]) else {
-                                    long.store(true, Ordering::Relaxed);
-                                    return;
-                                };
-                                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                                let mut r = E {
-                                    ek,
-                                    uk: K::default(),
-                                    ingest,
-                                    ts: 0,
-                                    price: 0,
-                                    cat: 0,
-                                    kind: 0,
-                                };
-                                'v: {
-                                    if f[1].is_empty() || f[5].is_empty() {
-                                        break 'v;
-                                    }
-                                    let Some(ts) = parse_ts(f[2]) else { break 'v };
-                                    if ts < ws || ts >= we || ingest == i64::MAX || ingest - ts > DAY_MS {
-                                        break 'v;
-                                    }
-                                    let kind = match f[4] {
-                                        b"view" => 1,
-                                        b"cart" => 2,
-                                        b"purchase" => 3,
-                                        _ => break 'v,
-                                    };
-                                    if kind == 3 {
-                                        let Some(p) = parse_price(f[6]) else { break 'v };
-                                        r.price = p;
-                                    }
-                                    let Some(uk) = pack(f[1]) else {
-                                        long.store(true, Ordering::Relaxed);
-                                        break 'v;
-                                    };
-                                    r.uk = uk;
-                                    r.cat = prod.get(f[5]).unwrap_or(unknown_cat);
-                                    r.ts = (ts - base) as u32;
-                                    r.kind = kind;
-                                }
-                                out[(hk(ek) >> (64 - dbits)) as usize].push(r);
+                                let Some(r) = ectx.parse(f) else { return };
+                                let ek = r.ek;
+                                out.push((hk(ek) >> (64 - dbits)) as usize, r);
                             });
-                            out
+                            out.finish()
                         })
                         .collect::<Vec<_>>()
                 },
@@ -479,7 +675,7 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                         .par_iter()
                         .map(|c| {
                             let buf = chunk_bytes(&ck_maps, c);
-                            let mut out: Vec<Vec<C>> = (0..PB).map(|_| Vec::new()).collect();
+                            let mut out: Scatter<C, 16> = Scatter::new(PB, (c.end - c.start) / 50 / PB + 16);
                             for_records::<4>(buf, |f| {
                                 if f[0].is_empty() || f[1].is_empty() {
                                     return;
@@ -493,9 +689,9 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                                     long.store(true, Ordering::Relaxed);
                                     return;
                                 };
-                                out[pbucket(uk)].push(C { k: uk, ck, ts: (ts - base) as u32, camp: cp });
+                                out.push(pbucket(uk), C { k: uk, ck, ts: (ts - base) as u32, camp: cp });
                             });
-                            out
+                            out.finish()
                         })
                         .collect::<Vec<_>>()
                 },
@@ -522,42 +718,56 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
     let sv_parts: Vec<Vec<Vec<S>>> = groups
         .into_par_iter()
         .map(|g| {
-            let mut out: Vec<Vec<S>> = (0..PB).map(|_| Vec::new()).collect();
+            let n_in: usize = g.iter().flatten().map(|v| v.len()).sum();
+            let mut out: Scatter<S, 16> = Scatter::new(PB, n_in / PB * 5 / 4 + 16);
             let mut table: Vec<u32> = vec![];
             for parts in g {
-                let v = concat(parts);
-                let size = (v.len() * 2).next_power_of_two().max(16);
+                // index records in place: piece << 20 | offset (pieces are parse chunks)
+                let n: usize = parts.iter().map(|v| v.len()).sum();
+                let in_place = parts.len() < 4096 && parts.iter().all(|v| v.len() < (1 << 20));
+                let flat;
+                let pieces: Vec<&[E]> = if in_place {
+                    parts.iter().map(|v| v.as_slice()).collect()
+                } else {
+                    flat = concat(parts.clone());
+                    flat.chunks(1 << 19).collect()
+                };
+                let size = (n * 2).next_power_of_two().max(16);
                 let mask = size - 1;
                 table.clear();
                 table.resize(size, u32::MAX);
-                for (i, r) in v.iter().enumerate() {
-                    let mut s = hk(r.ek) as usize & mask;
-                    loop {
-                        let t = table[s];
-                        if t == u32::MAX {
-                            table[s] = i as u32;
-                            break;
-                        }
-                        let o = &v[t as usize];
-                        if o.ek == r.ek {
-                            if r.ingest < o.ingest {
-                                table[s] = i as u32;
+                let at = |t: u32| -> &E { &pieces[(t >> 20) as usize][(t & 0xF_FFFF) as usize] };
+                for (pi, piece) in pieces.iter().enumerate() {
+                    for (i, r) in piece.iter().enumerate() {
+                        let me = ((pi as u32) << 20) | i as u32;
+                        let mut s = hk(r.ek) as usize & mask;
+                        loop {
+                            let t = table[s];
+                            if t == u32::MAX {
+                                table[s] = me;
+                                break;
                             }
-                            break;
+                            let o = at(t);
+                            if o.ek == r.ek {
+                                if r.ingest < o.ingest {
+                                    table[s] = me;
+                                }
+                                break;
+                            }
+                            s = (s + 1) & mask;
                         }
-                        s = (s + 1) & mask;
                     }
                 }
                 for &t in &table {
                     if t != u32::MAX {
-                        let r = &v[t as usize];
+                        let r = at(t);
                         if r.kind != 0 {
-                            out[pbucket(r.uk)].push(S { k: r.uk, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                            out.push(pbucket(r.uk), S { k: r.uk, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                         }
                     }
                 }
             }
-            out
+            out.finish()
         })
         .collect();
     log("deduped");
@@ -573,8 +783,8 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
             let look = |k: K| -> K { lb.map.get(&k).copied().unwrap_or(k) };
             let ns: usize = sp.iter().map(|v| v.len()).sum();
             let nc: usize = cp.iter().map(|v| v.len()).sum();
-            let mut so: Vec<Vec<S>> = (0..PB).map(|_| Vec::with_capacity(ns / PB * 5 / 4 + 16)).collect();
-            let mut co: Vec<Vec<C>> = (0..PB).map(|_| Vec::with_capacity(nc / PB * 5 / 4 + 16)).collect();
+            let mut so: Scatter<S, 16> = Scatter::new(PB, ns / PB * 5 / 4 + 16);
+            let mut co: Scatter<C, 16> = Scatter::new(PB, nc / PB * 5 / 4 + 16);
             let mut last = (K(u64::MAX, u64::MAX), K::default());
             for part in sp {
                 for mut r in part {
@@ -582,7 +792,7 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                         last = (r.k, look(r.k));
                     }
                     r.k = last.1;
-                    so[pbucket(r.k)].push(r);
+                    so.push(pbucket(r.k), r);
                 }
             }
             for part in cp {
@@ -591,10 +801,10 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                         last = (r.k, look(r.k));
                     }
                     r.k = last.1;
-                    co[pbucket(r.k)].push(r);
+                    co.push(pbucket(r.k), r);
                 }
             }
-            (so, co)
+            (so.finish(), co.finish())
         })
         .collect();
     let mut sp = Vec::with_capacity(PB);

@@ -17,6 +17,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
+    if let Ok(f) = std::env::var("BENCH_FILE") {
+        fast::bench(data, f.into());
+        return;
+    }
     let force_slow = std::env::var("FORCE_SLOW").is_ok();
     if force_slow || fast::run(data.clone(), out.clone(), ncpu).is_err() {
         eprintln!("using string-based path");
