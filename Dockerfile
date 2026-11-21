@@ -10,4 +10,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/pipeline /app/pipeline
 USER 1000
+# Keep freed memory in the process (no purge back to the OS): each pipeline phase reuses
+# the previous phase's pages instead of faulting in fresh zeroed ones.
+ENV MIMALLOC_PURGE_DELAY=-1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 CMD ["/app/pipeline"]

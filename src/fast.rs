@@ -26,7 +26,7 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
 use crate::slow::{
-    DAY_MS, GAP_MS, Lookup, WEEK_MS, list_csv, manifest_ts, map_files, mix, parse_price, parse_ts,
+    DAY_MS, GAP_MS, Lookup, WEEK_MS, list_csv, manifest_ts, mix, parse_price, parse_ts,
     read_pairs, read_small,
 };
 
@@ -225,16 +225,81 @@ struct CR {
     camp: u16,
 }
 
-/// The bytes of a chunk, faulted in by the calling worker in one go.
-#[inline]
-fn chunk_bytes<'a>(maps: &'a [Option<memmap2::Mmap>], c: &crate::slow::Chunk) -> &'a [u8] {
-    let m = maps[c.file].as_ref().unwrap();
-    #[cfg(target_os = "linux")]
-    {
-        let page = c.start & !4095;
-        let _ = m.advise_range(memmap2::Advice::PopulateRead, page, c.end - page);
+/// Input read with pread into reusable per-thread buffers (no mmap page faults).
+/// A chunk owns the lines that start in [start, end); the first chunk of a file skips the header.
+struct Src {
+    files: Vec<(File, u64)>,
+    chunks: Vec<(usize, u64, u64)>,
+}
+
+const RCHUNK: u64 = 8 << 20;
+
+fn open_src(paths: &[PathBuf]) -> Src {
+    let mut files = vec![];
+    let mut chunks = vec![];
+    for p in paths {
+        let f = File::open(p).expect("open");
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let fi = files.len();
+        files.push((f, len));
+        let step: u64 = std::env::var("RCHUNK").ok().and_then(|x| x.parse().ok()).unwrap_or(RCHUNK);
+        let mut s = 0;
+        while s < len {
+            let e = (s + step).min(len);
+            chunks.push((fi, s, e));
+            s = e;
+        }
     }
-    &m[c.start..c.end]
+    Src { files, chunks }
+}
+
+thread_local! {
+    static RBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn read_full(f: &File, off: u64, out: &mut [u8]) {
+    use std::os::unix::fs::FileExt;
+    let mut done = 0;
+    while done < out.len() {
+        let n = f.read_at(&mut out[done..], off + done as u64).expect("read");
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+}
+
+/// Run `f` on the bytes of the lines owned by chunk `ci`.
+fn with_chunk<R>(src: &Src, ci: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    let (fi, start, end) = src.chunks[ci];
+    let (file, flen) = (&src.files[fi].0, src.files[fi].1);
+    RBUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let off = if start == 0 { 0 } else { start - 1 };
+        let mut stop = (end + 65536).min(flen);
+        loop {
+            let need = (stop - off) as usize;
+            if buf.len() < need {
+                buf.resize(need, 0);
+            }
+            read_full(file, off, &mut buf[..need]);
+            // first line start owned by this chunk
+            let s = match memchr::memchr(b'\n', &buf[..need]) {
+                Some(i) => i + 1, // header (start 0) or the end of the previous chunk's line
+                None => return f(&[]),
+            };
+            if off + s as u64 >= end {
+                return f(&[]);
+            }
+            // end of the last line starting before `end`
+            let from = (end - 1 - off) as usize;
+            match memchr::memchr(b'\n', &buf[from..need]) {
+                Some(i) => return f(&buf[s..from + i + 1]),
+                None if stop == flen => return f(&buf[s..need]),
+                None => stop = (stop + (8 << 20)).min(flen),
+            }
+        }
+    })
 }
 
 /// Everything needed to turn one event line into a record.
@@ -508,12 +573,11 @@ struct LinkBucket {
 
 fn build_links(data: &PathBuf, long: &AtomicBool) -> Vec<LinkBucket> {
     let paths = list_csv(&data.join("links"));
-    let (maps, chunks) = map_files(&paths);
+    let src = open_src(&paths);
     // parse: pairs per chunk, plus every key bucketed
-    let parsed: Vec<(Vec<(K, K)>, Vec<Vec<K>>)> = chunks
-        .par_iter()
-        .map(|c| {
-            let buf = chunk_bytes(&maps, c);
+    let parsed: Vec<(Vec<(K, K)>, Vec<Vec<K>>)> = (0..src.chunks.len())
+        .into_par_iter()
+        .map(|ci| with_chunk(&src, ci, |buf| {
             let mut pairs = vec![];
             let mut keys: Vec<Vec<K>> = (0..PB).map(|_| vec![]).collect();
             for_records::<2>(buf, |f| {
@@ -529,7 +593,7 @@ fn build_links(data: &PathBuf, long: &AtomicBool) -> Vec<LinkBucket> {
                 keys[pbucket(b)].push(b);
             });
             (pairs, keys)
-        })
+        }))
         .collect();
     let mut pair_lists = Vec::with_capacity(parsed.len());
     let mut key_parts = Vec::with_capacity(parsed.len());
@@ -642,12 +706,12 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
     // ---- links (in parallel with parsing)
     let ev_paths = list_csv(&data.join("events"));
     let ck_paths = list_csv(&data.join("clicks"));
-    let (ev_maps, ev_chunks) = map_files(&ev_paths);
-    let (ck_maps, ck_chunks) = map_files(&ck_paths);
-    let ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
+    let ev_src = open_src(&ev_paths);
+    let ck_src = open_src(&ck_paths);
+    let ev_bytes: usize = ev_src.files.iter().map(|f| f.1 as usize).sum();
     let dbits: u32 = if ev_bytes > (4usize << 30) { 9 } else { 8 };
     let nd = 1usize << dbits;
-    log(&format!("lookups; {} event chunks, {} dedup buckets", ev_chunks.len(), nd));
+    log(&format!("lookups; {} event chunks, {} dedup buckets", ev_src.chunks.len(), nd));
 
     let ectx = ECtx { ws, we, base, prod: &prod, unknown_cat, long: &long };
     let (links, (ev_parts, ck_parts)) = rayon::join(
@@ -655,11 +719,10 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
         || {
             rayon::join(
                 || {
-                    ev_chunks
-                        .par_iter()
-                        .map(|c| {
-                            let buf = chunk_bytes(&ev_maps, c);
-                            let cap = (c.end - c.start) / 70 / nd + 4;
+                    (0..ev_src.chunks.len())
+                        .into_par_iter()
+                        .map(|ci| with_chunk(&ev_src, ci, |buf| {
+                            let cap = buf.len() / 70 / nd + 4;
                             let mut out: Scatter<E, 16> = Scatter::new(nd, cap);
                             for_records::<7>(buf, |f| {
                                 let Some(r) = ectx.parse(f) else { return };
@@ -667,15 +730,14 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                                 out.push((hk(ek) >> (64 - dbits)) as usize, r);
                             });
                             out.finish()
-                        })
+                        }))
                         .collect::<Vec<_>>()
                 },
                 || {
-                    ck_chunks
-                        .par_iter()
-                        .map(|c| {
-                            let buf = chunk_bytes(&ck_maps, c);
-                            let mut out: Scatter<C, 16> = Scatter::new(PB, (c.end - c.start) / 50 / PB + 16);
+                    (0..ck_src.chunks.len())
+                        .into_par_iter()
+                        .map(|ci| with_chunk(&ck_src, ci, |buf| {
+                            let mut out: Scatter<C, 16> = Scatter::new(PB, buf.len() / 50 / PB + 16);
                             for_records::<4>(buf, |f| {
                                 if f[0].is_empty() || f[1].is_empty() {
                                     return;
@@ -692,7 +754,7 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
                                 out.push(pbucket(uk), C { k: uk, ck, ts: (ts - base) as u32, camp: cp });
                             });
                             out.finish()
-                        })
+                        }))
                         .collect::<Vec<_>>()
                 },
             )
@@ -702,8 +764,6 @@ pub fn run(data: PathBuf, out: PathBuf, ncpu: usize) -> Result<(), ()> {
     if long.load(Ordering::Relaxed) {
         return Err(());
     }
-    drop(ev_maps);
-    drop(ck_maps);
 
     // ---- dedup: groups of event_id buckets, survivors bucketed by user
     let ev_buckets = transpose(ev_parts, nd);
