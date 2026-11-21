@@ -1,10 +1,6 @@
 dev/
 out/
-dev-answer/
-target/
-*.parquet
-
-
-# Added by cargo
-
+dev-answer
 /target
+__pycache__/
+*.parquet
